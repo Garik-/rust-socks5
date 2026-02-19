@@ -1,14 +1,12 @@
 use std::convert::TryFrom;
 use std::io::{Read, Write};
+use std::net::{self, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::net::{TcpListener, TcpStream};
 use std::thread;
 use std::time::Duration;
 use thiserror::Error;
 use tracing::{debug, error, info};
-
 use tracing_subscriber::FmtSubscriber;
-
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
 const VERSION: u8 = 0x05;
 
@@ -82,9 +80,11 @@ impl ServerReply {
     }
 
     fn succeeded(local: SocketAddr) -> Self {
+        use std::net::IpAddr::*;
+
         let (atyp, addr) = match local.ip() {
-            std::net::IpAddr::V4(v4) => (AddressType::IPv4, v4.octets().to_vec()),
-            std::net::IpAddr::V6(v6) => (AddressType::IPv6, v6.octets().to_vec()),
+            V4(v4) => (AddressType::IPv4, v4.octets().to_vec()),
+            V6(v6) => (AddressType::IPv6, v6.octets().to_vec()),
         };
 
         Self {

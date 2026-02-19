@@ -4,7 +4,8 @@ use std::net::{TcpListener, TcpStream};
 use std::thread;
 use std::time::Duration;
 use thiserror::Error;
-use tracing::{debug, error, info, subscriber};
+use tracing::{debug, error, info};
+
 use tracing_subscriber::FmtSubscriber;
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -20,7 +21,7 @@ enum Reply {
     NetworkUnreachable = 3,
     HostUnreachable = 4,
     ConnectionRefused = 5,
-    TTLExpired = 6,
+    // TTLExpired = 6,
     CommandNotSupported = 7,
     AddressTypeNotSupported = 8,
 }
@@ -42,6 +43,19 @@ impl TryFrom<u8> for AddressType {
             0x04 => Ok(AddressType::IPv6),
             _ => Err(()),
         }
+    }
+}
+
+fn map_connect_error(e: &std::io::Error) -> Reply {
+    use std::io::ErrorKind::*;
+
+    match e.kind() {
+        ConnectionRefused => Reply::ConnectionRefused,
+        NetworkUnreachable => Reply::NetworkUnreachable,
+        HostUnreachable => Reply::HostUnreachable,
+        TimedOut => Reply::HostUnreachable,
+        PermissionDenied => Reply::ConnectionNotAllowedByRuleset,
+        _ => Reply::ServerFailure,
     }
 }
 
@@ -101,6 +115,9 @@ enum ProtocolError {
     #[error("address type not supported")]
     AddressTypeNotSupported,
 
+    #[error("no acceptable methods")]
+    NoAcceptableMethods,
+
     #[error("unexpected eof")]
     UnexpectedEof,
 
@@ -135,7 +152,7 @@ fn handshake(stream: &mut (impl Read + Write)) -> Result<(), ProtocolError> {
 
     let n_methods = header[1] as usize;
 
-    if n_methods < 1 || n_methods > 255 {
+    if !(1..=255).contains(&n_methods) {
         return Err(ProtocolError::UnexpectedEof);
     }
 
@@ -156,15 +173,18 @@ fn handshake(stream: &mut (impl Read + Write)) -> Result<(), ProtocolError> {
     print_hex(&header);
 
     stream.write_all(&header)?;
-    stream.flush()?;
+
+    if header[1] == NO_ACCEPTABLE_METHODS {
+        return Err(ProtocolError::NoAcceptableMethods);
+    }
 
     Ok(())
 }
 
 fn send_fail(stream: &mut impl Write, reply: Reply) -> Result<(), ProtocolError> {
+    error!(reply = ?reply, "send_fail");
     let reply = ServerReply::fail(reply);
     stream.write_all(&reply.to_bytes())?;
-    stream.flush()?;
 
     Ok(())
 }
@@ -209,33 +229,63 @@ fn request(stream: &mut (impl Read + Write)) -> Result<SocketAddr, ProtocolError
         return Err(ProtocolError::CommandNotSupported);
     }
 
+    if header[2] != 0x00 {
+        return Err(ProtocolError::UnexpectedEof);
+    }
+
     let atyp =
         AddressType::try_from(header[3]).map_err(|_| ProtocolError::AddressTypeNotSupported)?;
 
     match atyp {
-        AddressType::IPv4 => return read_ipv4(stream),
-        AddressType::IPv6 => return read_ipv6(stream),
-    };
+        AddressType::IPv4 => read_ipv4(stream),
+        AddressType::IPv6 => read_ipv6(stream),
+    }
 }
 
-fn handle_connection(mut stream: TcpStream) -> Result<(), ProtocolError> {
+fn set_timeouts(stream: &mut TcpStream) -> Result<(), std::io::Error> {
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    Ok(())
+}
 
-    handshake(&mut stream)?;
+fn handle_connection(mut src: TcpStream) -> Result<(), ProtocolError> {
+    let peer_addr = src.peer_addr()?;
+    let span = tracing::debug_span!("connection", client = %peer_addr);
+    let _enter = span.enter();
 
-    let addr = match request(&mut stream) {
+    set_timeouts(&mut src)?;
+
+    handshake(&mut src)?;
+
+    let addr = match request(&mut src) {
         Ok(addr) => addr,
         Err(ProtocolError::AddressTypeNotSupported) => {
-            return send_fail(&mut stream, Reply::AddressTypeNotSupported);
+            return send_fail(&mut src, Reply::AddressTypeNotSupported);
         }
         Err(ProtocolError::CommandNotSupported) => {
-            return send_fail(&mut stream, Reply::CommandNotSupported);
+            return send_fail(&mut src, Reply::CommandNotSupported);
         }
         Err(e) => return Err(e),
     };
 
-    debug!(addr = %addr, "request");
+    info!(addr = %addr, "request");
+
+    let mut dst = match TcpStream::connect_timeout(&addr, Duration::from_secs(10)) {
+        Ok(s) => s,
+        Err(e) => {
+            return send_fail(&mut src, map_connect_error(&e));
+        }
+    };
+
+    debug!("connected");
+
+    {
+        let local = dst.local_addr()?;
+        let reply = ServerReply::succeeded(local);
+        src.write_all(&reply.to_bytes())?;
+    }
+
+    set_timeouts(&mut dst)?;
 
     Ok(())
 }
@@ -257,7 +307,6 @@ fn main() {
                     if let Err(e) = handle_connection(stream) {
                         error!(error = %e, "handle_connection");
                     }
-                    debug!("connection close");
                 });
             }
             Err(e) => {

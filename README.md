@@ -6,3 +6,5 @@
 
 
 https://github.com/Garik-/mini_socks5
+
+хотел сделать через select нормально, а тут в rust хрен его затщишь без unsafe, проще сразу юзать tokio и tokio::io::copy_bidirectional

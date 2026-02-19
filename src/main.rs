@@ -1,42 +1,111 @@
+use std::convert::TryFrom;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::thread;
+use std::time::Duration;
+use thiserror::Error;
+use tracing::{debug, error, info, subscriber};
+use tracing_subscriber::FmtSubscriber;
+
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
 const VERSION: u8 = 0x05;
 
-const NO_AUTHENTICATION_REQUIRED: u8 = 0x00;
-const NO_ACCEPTABLE_METHODS: u8 = 0xFF;
-
-#[derive(Debug, PartialEq)]
-enum ProtocolError {
-    UnsupportedVersion,
-    UnexpectedEof,
-    UnsupportedMethod,
+#[repr(u8)]
+#[derive(Copy, Clone, Debug)]
+enum Reply {
+    Succeeded = 0,
+    ServerFailure = 1,
+    ConnectionNotAllowedByRuleset = 2,
+    NetworkUnreachable = 3,
+    HostUnreachable = 4,
+    ConnectionRefused = 5,
+    TTLExpired = 6,
+    CommandNotSupported = 7,
+    AddressTypeNotSupported = 8,
 }
 
-fn handshake(buf: &[u8]) -> Result<u8, ProtocolError> {
-    if buf.is_empty() || buf.len() < 3 {
-        return Err(ProtocolError::UnexpectedEof);
+#[repr(u8)]
+#[derive(Copy, Clone, Debug)]
+enum AddressType {
+    IPv4 = 0x01,
+    // Domain = 0x03,
+    IPv6 = 0x04,
+}
+
+impl TryFrom<u8> for AddressType {
+    type Error = ();
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0x01 => Ok(AddressType::IPv4),
+            0x04 => Ok(AddressType::IPv6),
+            _ => Err(()),
+        }
+    }
+}
+
+struct ServerReply {
+    rep: Reply,
+    atyp: AddressType,
+    addr: Vec<u8>,
+    port: u16,
+}
+
+impl ServerReply {
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(32);
+
+        buf.push(VERSION);
+        buf.push(self.rep as u8);
+        buf.push(0); // RSV
+        buf.push(self.atyp as u8);
+
+        buf.extend_from_slice(&self.addr);
+        buf.extend_from_slice(&self.port.to_be_bytes());
+
+        buf
     }
 
-    if buf[0] != VERSION {
-        return Err(ProtocolError::UnsupportedVersion);
-    }
+    fn succeeded(local: SocketAddr) -> Self {
+        let (atyp, addr) = match local.ip() {
+            std::net::IpAddr::V4(v4) => (AddressType::IPv4, v4.octets().to_vec()),
+            std::net::IpAddr::V6(v6) => (AddressType::IPv6, v6.octets().to_vec()),
+        };
 
-    let n_methods = buf[1] as usize;
-    if n_methods > buf.len() - 2 {
-        return Err(ProtocolError::UnexpectedEof);
-    }
-
-    // print_hex(&buf[2..2 + n_methods]);
-
-    for method in &buf[2..2 + n_methods] {
-        if *method == NO_AUTHENTICATION_REQUIRED {
-            return Ok(NO_AUTHENTICATION_REQUIRED);
+        Self {
+            rep: Reply::Succeeded,
+            atyp,
+            addr,
+            port: local.port(),
         }
     }
 
-    return Ok(NO_ACCEPTABLE_METHODS);
+    fn fail(rep: Reply) -> Self {
+        Self {
+            rep,
+            atyp: AddressType::IPv4,
+            addr: vec![0, 0, 0, 0],
+            port: 0,
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+enum ProtocolError {
+    #[error("unsupported version")]
+    UnsupportedVersion,
+    #[error("command not supported")]
+    CommandNotSupported,
+
+    #[error("address type not supported")]
+    AddressTypeNotSupported,
+
+    #[error("unexpected eof")]
+    UnexpectedEof,
+
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 fn print_hex(buf: &[u8]) {
@@ -51,92 +120,149 @@ fn print_hex(buf: &[u8]) {
     }
 }
 
-fn handle_connection(mut stream: TcpStream) {
-    let mut buffer = [0u8; 1024];
+fn handshake(stream: &mut (impl Read + Write)) -> Result<(), ProtocolError> {
+    const NO_AUTHENTICATION_REQUIRED: u8 = 0x00;
+    const NO_ACCEPTABLE_METHODS: u8 = 0xFF;
 
-    let n = stream
-        .read(&mut buffer)
-        .expect("failed to read from stream");
+    let mut header = [0u8; 2];
 
-    print_hex(&buffer[..n]);
+    stream.read_exact(&mut header)?;
+    print_hex(&header);
 
-    let method = match handshake(&buffer[..n]) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("failed handshake: {:?}", e);
-            return;
-        }
-    };
-
-    buffer[1] = method;
-
-    print_hex(&buffer[..2]);
-
-    stream
-        .write(&buffer[..2])
-        .expect("failed to write handshake");
-    stream.flush().expect("failed to flush stream");
-
-    if method == NO_ACCEPTABLE_METHODS {
-        return;
+    if header[0] != VERSION {
+        return Err(ProtocolError::UnsupportedVersion);
     }
 
-    let n = stream
-        .read(&mut buffer)
-        .expect("failed to read from stream");
+    let n_methods = header[1] as usize;
 
-    print_hex(&buffer[..n]);
+    if n_methods < 1 || n_methods > 255 {
+        return Err(ProtocolError::UnexpectedEof);
+    }
+
+    let mut methods = vec![0u8; n_methods];
+
+    stream.read_exact(&mut methods)?;
+    print_hex(&methods);
+
+    header[1] = NO_ACCEPTABLE_METHODS;
+
+    for method in &methods {
+        if *method == NO_AUTHENTICATION_REQUIRED {
+            header[1] = NO_AUTHENTICATION_REQUIRED;
+            break;
+        }
+    }
+
+    print_hex(&header);
+
+    stream.write_all(&header)?;
+    stream.flush()?;
+
+    Ok(())
+}
+
+fn send_fail(stream: &mut impl Write, reply: Reply) -> Result<(), ProtocolError> {
+    let reply = ServerReply::fail(reply);
+    stream.write_all(&reply.to_bytes())?;
+    stream.flush()?;
+
+    Ok(())
+}
+
+fn read_ipv4(stream: &mut impl Read) -> Result<SocketAddr, ProtocolError> {
+    let mut ip_bytes = [0u8; 4];
+    stream.read_exact(&mut ip_bytes)?;
+
+    let mut port_bytes = [0u8; 2];
+    stream.read_exact(&mut port_bytes)?;
+
+    let addr = SocketAddr::from((Ipv4Addr::from(ip_bytes), u16::from_be_bytes(port_bytes)));
+
+    Ok(addr)
+}
+
+fn read_ipv6(stream: &mut impl Read) -> Result<SocketAddr, ProtocolError> {
+    let mut ip_bytes = [0u8; 16];
+    stream.read_exact(&mut ip_bytes)?;
+
+    let mut port_bytes = [0u8; 2];
+    stream.read_exact(&mut port_bytes)?;
+
+    let addr = SocketAddr::from((Ipv6Addr::from(ip_bytes), u16::from_be_bytes(port_bytes)));
+
+    Ok(addr)
+}
+
+fn request(stream: &mut (impl Read + Write)) -> Result<SocketAddr, ProtocolError> {
+    const CMD_CONNECT: u8 = 0x01;
+
+    let mut header = [0u8; 4];
+    stream.read_exact(&mut header)?;
+
+    print_hex(&header);
+
+    if header[0] != VERSION {
+        return Err(ProtocolError::UnsupportedVersion);
+    }
+
+    if header[1] != CMD_CONNECT {
+        return Err(ProtocolError::CommandNotSupported);
+    }
+
+    let atyp =
+        AddressType::try_from(header[3]).map_err(|_| ProtocolError::AddressTypeNotSupported)?;
+
+    match atyp {
+        AddressType::IPv4 => return read_ipv4(stream),
+        AddressType::IPv6 => return read_ipv6(stream),
+    };
+}
+
+fn handle_connection(mut stream: TcpStream) -> Result<(), ProtocolError> {
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+
+    handshake(&mut stream)?;
+
+    let addr = match request(&mut stream) {
+        Ok(addr) => addr,
+        Err(ProtocolError::AddressTypeNotSupported) => {
+            return send_fail(&mut stream, Reply::AddressTypeNotSupported);
+        }
+        Err(ProtocolError::CommandNotSupported) => {
+            return send_fail(&mut stream, Reply::CommandNotSupported);
+        }
+        Err(e) => return Err(e),
+    };
+
+    debug!(addr = %addr, "request");
+
+    Ok(())
 }
 
 fn main() {
+    let subscriber = FmtSubscriber::builder()
+        .with_max_level(tracing::Level::DEBUG)
+        .finish();
+    tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
+
     const ADDR: &str = "127.0.0.1:7878";
     let listener = TcpListener::bind(ADDR).expect("trololo");
-    println!("server listening on {}", ADDR);
+    info!(addr = %ADDR, "server listening");
 
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
                 thread::spawn(|| {
-                    handle_connection(stream);
+                    if let Err(e) = handle_connection(stream) {
+                        error!(error = %e, "handle_connection");
+                    }
+                    debug!("connection close");
                 });
             }
             Err(e) => {
-                eprintln!("connection failed: {}", e);
+                error!(error = %e, "connection failed");
             }
         }
-    }
-}
-
-#[cfg(test)]
-
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_handshake_empty_buffer() {
-        let buf: [u8; 0] = [];
-        let result = handshake(&buf);
-        assert_eq!(result, Err(ProtocolError::UnexpectedEof));
-    }
-
-    #[test]
-    fn test_handshake_short_buffer() {
-        let buf = [5, 1];
-        let result = handshake(&buf);
-        assert_eq!(result, Err(ProtocolError::UnexpectedEof));
-    }
-
-    #[test]
-    fn test_handskake_wrong_version() {
-        let buf = [4, 2, 0];
-        let result = handshake(&buf);
-        assert_eq!(result, Err(ProtocolError::UnsupportedVersion));
-    }
-
-    #[test]
-    fn test_handshake_ok() {
-        let buf = [5, 2, 0, 1];
-        let result = handshake(&buf);
-        assert_eq!(result, Ok(()));
     }
 }

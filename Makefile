@@ -1,4 +1,6 @@
-.PHONY: fmt lint test run dev
+.PHONY: fmt lint test run dev build build-aarch64 install-aarch64-target
+
+AARCH64_TARGET ?= aarch64-unknown-linux-gnu
 
 fmt:
 	cargo fmt
@@ -10,8 +12,16 @@ test:
 	cargo test
 
 run:
-	cargo run
+	TP_LOG_LEVEL=debug cargo run
 
 dev:
 	curl --socks5 127.0.0.1:7878 https://habr.ru
 
+build:
+	cargo build --release
+
+install-aarch64-target:
+	rustup target add $(AARCH64_TARGET)
+
+build-aarch64: install-aarch64-target
+	cargo build --release --target $(AARCH64_TARGET)

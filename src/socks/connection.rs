@@ -1,0 +1,121 @@
+use std::io;
+use std::net::SocketAddr;
+use std::time::Instant;
+
+use tokio::io::copy_bidirectional;
+use tokio::net::TcpStream;
+use tokio::time;
+use tokio_util::sync::CancellationToken;
+use tracing::debug;
+
+use crate::config::SocksConfig;
+
+use super::ProtocolError;
+use super::cancellable_io;
+use super::protocol::{self, IoTimeouts, Reply};
+
+pub async fn handle_connection(
+    mut src: TcpStream,
+    shutdown: CancellationToken,
+    config: SocksConfig,
+) -> Result<(), ProtocolError> {
+    let started_at = Instant::now();
+    let io_timeouts = IoTimeouts {
+        read: config.read_timeout,
+        write: config.write_timeout,
+    };
+
+    let result = async {
+        protocol::handshake(&mut src, &shutdown, io_timeouts).await?;
+
+        let addr = match protocol::request(&mut src, &shutdown, io_timeouts).await {
+            Ok(addr) => addr,
+            Err(ProtocolError::AddressTypeNotSupported) => {
+                protocol::send_fail(
+                    &mut src,
+                    Reply::AddressTypeNotSupported,
+                    &shutdown,
+                    io_timeouts,
+                )
+                .await?;
+                return Ok(());
+            }
+            Err(ProtocolError::CommandNotSupported) => {
+                protocol::send_fail(&mut src, Reply::CommandNotSupported, &shutdown, io_timeouts)
+                    .await?;
+                return Ok(());
+            }
+            Err(err) => return Err(err),
+        };
+
+        debug!(addr = %addr, "request");
+
+        let mut dst = match connect_target(addr, &shutdown, config.connect_timeout).await {
+            Ok(stream) => stream,
+            Err(err) => {
+                protocol::send_fail(&mut src, map_connect_error(&err), &shutdown, io_timeouts)
+                    .await?;
+                return Ok(());
+            }
+        };
+
+        debug!("connected");
+
+        let reply = protocol::succeeded_reply(dst.local_addr()?);
+        protocol::write_all_cancel(&mut src, &reply, &shutdown, io_timeouts.write).await?;
+
+        let (from_client, from_target) = relay_bidirectional(&mut src, &mut dst, &shutdown).await?;
+        debug!(
+            from_client,
+            from_target,
+            elapsed_ms = started_at.elapsed().as_millis(),
+            "client closed connection"
+        );
+
+        Ok(())
+    }
+    .await;
+
+    match result {
+        Err(ProtocolError::Io(ref err)) if err.kind() == io::ErrorKind::Interrupted => {
+            debug!("connection received shutdown signal");
+            Ok(())
+        }
+        other => other,
+    }
+}
+
+fn map_connect_error(e: &io::Error) -> Reply {
+    use io::ErrorKind::*;
+
+    match e.kind() {
+        ConnectionRefused => Reply::ConnectionRefused,
+        NetworkUnreachable => Reply::NetworkUnreachable,
+        HostUnreachable => Reply::HostUnreachable,
+        TimedOut => Reply::HostUnreachable,
+        PermissionDenied => Reply::ConnectionNotAllowedByRuleset,
+        _ => Reply::ServerFailure,
+    }
+}
+
+async fn connect_target(
+    addr: SocketAddr,
+    shutdown: &CancellationToken,
+    connect_timeout: std::time::Duration,
+) -> Result<TcpStream, io::Error> {
+    cancellable_io(shutdown, async move {
+        match time::timeout(connect_timeout, TcpStream::connect(addr)).await {
+            Ok(result) => result,
+            Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "connect timeout")),
+        }
+    })
+    .await
+}
+
+async fn relay_bidirectional(
+    src: &mut TcpStream,
+    dst: &mut TcpStream,
+    shutdown: &CancellationToken,
+) -> Result<(u64, u64), io::Error> {
+    cancellable_io(shutdown, async { copy_bidirectional(src, dst).await }).await
+}

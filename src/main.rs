@@ -1,6 +1,6 @@
 use std::convert::TryFrom;
 use std::io::{Read, Write};
-use std::net::{self, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::net::{TcpListener, TcpStream};
 use std::thread;
 use std::time::Duration;

@@ -28,6 +28,7 @@ pub async fn handle_connection(
 
     let result = async {
         session.handshake(&mut src).await?;
+        configure_stream(&src)?;
 
         let addr = match session.request(&mut src).await {
             Ok(addr) => addr,
@@ -55,6 +56,7 @@ pub async fn handle_connection(
                 return Ok(());
             }
         };
+        configure_stream(&dst)?;
 
         debug!("connected");
 
@@ -82,6 +84,7 @@ pub async fn handle_connection(
     }
 }
 
+#[inline]
 fn map_connect_error(e: &io::Error) -> Reply {
     use io::ErrorKind::*;
 
@@ -115,4 +118,10 @@ async fn relay_bidirectional(
     shutdown: &CancellationToken,
 ) -> Result<(u64, u64), io::Error> {
     cancellable_io(shutdown, async { copy_bidirectional(src, dst).await }).await
+}
+
+#[inline]
+fn configure_stream(stream: &TcpStream) -> Result<(), io::Error> {
+    stream.set_nodelay(true)?;
+    Ok(())
 }

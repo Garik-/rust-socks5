@@ -33,6 +33,7 @@ enum AddressType {
 impl TryFrom<u8> for AddressType {
     type Error = ();
 
+    #[inline]
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
             0x01 => Ok(AddressType::IPv4),
@@ -259,6 +260,7 @@ impl<'a> SocksSession<'a> {
     }
 }
 
+#[inline]
 pub(super) fn succeeded_reply(local: SocketAddr) -> Vec<u8> {
     ServerReply::succeeded(local).to_bytes()
 }

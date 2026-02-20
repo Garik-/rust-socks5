@@ -1,6 +1,8 @@
-.PHONY: fmt lint test run dev build build-aarch64 install-aarch64-target
+.PHONY: fmt lint test run dev speed-check build build-aarch64 install-aarch64-target
 
 AARCH64_TARGET ?= aarch64-unknown-linux-gnu
+PROXY_ADDR ?= 127.0.0.1:7878
+CHECK_URL ?= https://habr.ru
 
 fmt:
 	cargo fmt
@@ -15,7 +17,7 @@ run:
 	TP_LOG_LEVEL=debug cargo run
 
 dev:
-	curl --socks5 127.0.0.1:7878 https://habr.ru
+	curl --socks5 $(PROXY_ADDR) $(CHECK_URL)
 
 build:
 	cargo build --release

@@ -12,7 +12,7 @@ use crate::config::SocksConfig;
 
 use super::ProtocolError;
 use super::cancellable_io;
-use super::protocol::{self, IoTimeouts, Reply};
+use super::protocol::{self, IoTimeouts, Reply, SocksSession};
 
 pub async fn handle_connection(
     mut src: TcpStream,
@@ -24,24 +24,22 @@ pub async fn handle_connection(
         read: config.read_timeout,
         write: config.write_timeout,
     };
+    let session = SocksSession::new(&shutdown, io_timeouts);
 
     let result = async {
-        protocol::handshake(&mut src, &shutdown, io_timeouts).await?;
+        session.handshake(&mut src).await?;
 
-        let addr = match protocol::request(&mut src, &shutdown, io_timeouts).await {
+        let addr = match session.request(&mut src).await {
             Ok(addr) => addr,
             Err(ProtocolError::AddressTypeNotSupported) => {
-                protocol::send_fail(
-                    &mut src,
-                    Reply::AddressTypeNotSupported,
-                    &shutdown,
-                    io_timeouts,
-                )
-                .await?;
+                session
+                    .send_fail(&mut src, Reply::AddressTypeNotSupported)
+                    .await?;
                 return Ok(());
             }
             Err(ProtocolError::CommandNotSupported) => {
-                protocol::send_fail(&mut src, Reply::CommandNotSupported, &shutdown, io_timeouts)
+                session
+                    .send_fail(&mut src, Reply::CommandNotSupported)
                     .await?;
                 return Ok(());
             }
@@ -53,8 +51,7 @@ pub async fn handle_connection(
         let mut dst = match connect_target(addr, &shutdown, config.connect_timeout).await {
             Ok(stream) => stream,
             Err(err) => {
-                protocol::send_fail(&mut src, map_connect_error(&err), &shutdown, io_timeouts)
-                    .await?;
+                session.send_fail(&mut src, map_connect_error(&err)).await?;
                 return Ok(());
             }
         };
@@ -62,7 +59,7 @@ pub async fn handle_connection(
         debug!("connected");
 
         let reply = protocol::succeeded_reply(dst.local_addr()?);
-        protocol::write_all_cancel(&mut src, &reply, &shutdown, io_timeouts.write).await?;
+        session.write_all(&mut src, &reply).await?;
 
         let (from_client, from_target) = relay_bidirectional(&mut src, &mut dst, &shutdown).await?;
         debug!(

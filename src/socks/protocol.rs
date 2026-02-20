@@ -109,178 +109,158 @@ pub(super) struct IoTimeouts {
     pub(super) write: Duration,
 }
 
+pub(super) struct SocksSession<'a> {
+    shutdown: &'a CancellationToken,
+    timeouts: IoTimeouts,
+}
+
+impl<'a> SocksSession<'a> {
+    pub(super) fn new(shutdown: &'a CancellationToken, timeouts: IoTimeouts) -> Self {
+        Self { shutdown, timeouts }
+    }
+
+    pub(super) async fn handshake<S>(&self, stream: &mut S) -> Result<(), ProtocolError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        const NO_AUTHENTICATION_REQUIRED: u8 = 0x00;
+        const NO_ACCEPTABLE_METHODS: u8 = 0xFF;
+
+        let mut header = [0u8; 2];
+        self.read_exact(stream, &mut header).await?;
+
+        if header[0] != VERSION {
+            return Err(ProtocolError::UnsupportedVersion);
+        }
+
+        let n_methods = header[1] as usize;
+        if !(1..=255).contains(&n_methods) {
+            return Err(ProtocolError::UnexpectedEof);
+        }
+
+        let mut methods = vec![0u8; n_methods];
+        self.read_exact(stream, &mut methods).await?;
+
+        header[1] = NO_ACCEPTABLE_METHODS;
+        for method in &methods {
+            if *method == NO_AUTHENTICATION_REQUIRED {
+                header[1] = NO_AUTHENTICATION_REQUIRED;
+                break;
+            }
+        }
+
+        self.write_all(stream, &header).await?;
+
+        if header[1] == NO_ACCEPTABLE_METHODS {
+            return Err(ProtocolError::NoAcceptableMethods);
+        }
+
+        Ok(())
+    }
+
+    pub(super) async fn request<S>(&self, stream: &mut S) -> Result<SocketAddr, ProtocolError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        const CMD_CONNECT: u8 = 0x01;
+
+        let mut header = [0u8; 4];
+        self.read_exact(stream, &mut header).await?;
+
+        if header[0] != VERSION {
+            return Err(ProtocolError::UnsupportedVersion);
+        }
+
+        if header[1] != CMD_CONNECT {
+            return Err(ProtocolError::CommandNotSupported);
+        }
+
+        if header[2] != 0x00 {
+            return Err(ProtocolError::UnexpectedEof);
+        }
+
+        let atyp =
+            AddressType::try_from(header[3]).map_err(|_| ProtocolError::AddressTypeNotSupported)?;
+
+        match atyp {
+            AddressType::IPv4 => self.read_ipv4(stream).await,
+            AddressType::IPv6 => self.read_ipv6(stream).await,
+        }
+    }
+
+    pub(super) async fn send_fail<S>(&self, stream: &mut S, reply: Reply) -> Result<(), io::Error>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let reply = ServerReply::fail(reply);
+        self.write_all(stream, &reply.to_bytes()).await
+    }
+
+    pub(super) async fn write_all<S>(&self, stream: &mut S, buf: &[u8]) -> Result<(), io::Error>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        tokio::select! {
+            _ = self.shutdown.cancelled() => Err(io::Error::new(io::ErrorKind::Interrupted, "shutdown")),
+            result = timeout(self.timeouts.write, stream.write_all(buf)) => {
+                match result {
+                    Ok(inner) => inner,
+                    Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "write timeout")),
+                }
+            }
+        }
+    }
+
+    async fn read_ipv4<S>(&self, stream: &mut S) -> Result<SocketAddr, ProtocolError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let mut ip_bytes = [0u8; 4];
+        self.read_exact(stream, &mut ip_bytes).await?;
+
+        let mut port_bytes = [0u8; 2];
+        self.read_exact(stream, &mut port_bytes).await?;
+
+        Ok(SocketAddr::from((
+            Ipv4Addr::from(ip_bytes),
+            u16::from_be_bytes(port_bytes),
+        )))
+    }
+
+    async fn read_ipv6<S>(&self, stream: &mut S) -> Result<SocketAddr, ProtocolError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let mut ip_bytes = [0u8; 16];
+        self.read_exact(stream, &mut ip_bytes).await?;
+
+        let mut port_bytes = [0u8; 2];
+        self.read_exact(stream, &mut port_bytes).await?;
+
+        Ok(SocketAddr::from((
+            Ipv6Addr::from(ip_bytes),
+            u16::from_be_bytes(port_bytes),
+        )))
+    }
+
+    async fn read_exact<S>(&self, stream: &mut S, buf: &mut [u8]) -> Result<(), io::Error>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        tokio::select! {
+            _ = self.shutdown.cancelled() => Err(io::Error::new(io::ErrorKind::Interrupted, "shutdown")),
+            result = timeout(self.timeouts.read, stream.read_exact(buf)) => {
+                match result {
+                    Ok(inner) => inner.map(|_| ()),
+                    Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "read timeout")),
+                }
+            }
+        }
+    }
+}
+
 pub(super) fn succeeded_reply(local: SocketAddr) -> Vec<u8> {
     ServerReply::succeeded(local).to_bytes()
-}
-
-pub(super) async fn send_fail<S>(
-    stream: &mut S,
-    reply: Reply,
-    shutdown: &CancellationToken,
-    timeouts: IoTimeouts,
-) -> Result<(), io::Error>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    let reply = ServerReply::fail(reply);
-    write_all_cancel(stream, &reply.to_bytes(), shutdown, timeouts.write).await
-}
-
-pub(super) async fn handshake<S>(
-    stream: &mut S,
-    shutdown: &CancellationToken,
-    timeouts: IoTimeouts,
-) -> Result<(), ProtocolError>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    const NO_AUTHENTICATION_REQUIRED: u8 = 0x00;
-    const NO_ACCEPTABLE_METHODS: u8 = 0xFF;
-
-    let mut header = [0u8; 2];
-    read_exact_cancel(stream, &mut header, shutdown, timeouts.read).await?;
-
-    if header[0] != VERSION {
-        return Err(ProtocolError::UnsupportedVersion);
-    }
-
-    let n_methods = header[1] as usize;
-    if !(1..=255).contains(&n_methods) {
-        return Err(ProtocolError::UnexpectedEof);
-    }
-
-    let mut methods = vec![0u8; n_methods];
-    read_exact_cancel(stream, &mut methods, shutdown, timeouts.read).await?;
-
-    header[1] = NO_ACCEPTABLE_METHODS;
-    for method in &methods {
-        if *method == NO_AUTHENTICATION_REQUIRED {
-            header[1] = NO_AUTHENTICATION_REQUIRED;
-            break;
-        }
-    }
-
-    write_all_cancel(stream, &header, shutdown, timeouts.write).await?;
-
-    if header[1] == NO_ACCEPTABLE_METHODS {
-        return Err(ProtocolError::NoAcceptableMethods);
-    }
-
-    Ok(())
-}
-
-pub(super) async fn request<S>(
-    stream: &mut S,
-    shutdown: &CancellationToken,
-    timeouts: IoTimeouts,
-) -> Result<SocketAddr, ProtocolError>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    const CMD_CONNECT: u8 = 0x01;
-
-    let mut header = [0u8; 4];
-    read_exact_cancel(stream, &mut header, shutdown, timeouts.read).await?;
-
-    if header[0] != VERSION {
-        return Err(ProtocolError::UnsupportedVersion);
-    }
-
-    if header[1] != CMD_CONNECT {
-        return Err(ProtocolError::CommandNotSupported);
-    }
-
-    if header[2] != 0x00 {
-        return Err(ProtocolError::UnexpectedEof);
-    }
-
-    let atyp =
-        AddressType::try_from(header[3]).map_err(|_| ProtocolError::AddressTypeNotSupported)?;
-
-    match atyp {
-        AddressType::IPv4 => read_ipv4(stream, shutdown, timeouts.read).await,
-        AddressType::IPv6 => read_ipv6(stream, shutdown, timeouts.read).await,
-    }
-}
-
-pub(super) async fn write_all_cancel<S>(
-    stream: &mut S,
-    buf: &[u8],
-    shutdown: &CancellationToken,
-    write_timeout: Duration,
-) -> Result<(), io::Error>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    tokio::select! {
-        _ = shutdown.cancelled() => Err(io::Error::new(io::ErrorKind::Interrupted, "shutdown")),
-        result = timeout(write_timeout, stream.write_all(buf)) => {
-            match result {
-                Ok(inner) => inner,
-                Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "write timeout")),
-            }
-        }
-    }
-}
-
-async fn read_ipv4<S>(
-    stream: &mut S,
-    shutdown: &CancellationToken,
-    read_timeout: Duration,
-) -> Result<SocketAddr, ProtocolError>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    let mut ip_bytes = [0u8; 4];
-    read_exact_cancel(stream, &mut ip_bytes, shutdown, read_timeout).await?;
-
-    let mut port_bytes = [0u8; 2];
-    read_exact_cancel(stream, &mut port_bytes, shutdown, read_timeout).await?;
-
-    Ok(SocketAddr::from((
-        Ipv4Addr::from(ip_bytes),
-        u16::from_be_bytes(port_bytes),
-    )))
-}
-
-async fn read_ipv6<S>(
-    stream: &mut S,
-    shutdown: &CancellationToken,
-    read_timeout: Duration,
-) -> Result<SocketAddr, ProtocolError>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    let mut ip_bytes = [0u8; 16];
-    read_exact_cancel(stream, &mut ip_bytes, shutdown, read_timeout).await?;
-
-    let mut port_bytes = [0u8; 2];
-    read_exact_cancel(stream, &mut port_bytes, shutdown, read_timeout).await?;
-
-    Ok(SocketAddr::from((
-        Ipv6Addr::from(ip_bytes),
-        u16::from_be_bytes(port_bytes),
-    )))
-}
-
-async fn read_exact_cancel<S>(
-    stream: &mut S,
-    buf: &mut [u8],
-    shutdown: &CancellationToken,
-    read_timeout: Duration,
-) -> Result<(), io::Error>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    tokio::select! {
-        _ = shutdown.cancelled() => Err(io::Error::new(io::ErrorKind::Interrupted, "shutdown")),
-        result = timeout(read_timeout, stream.read_exact(buf)) => {
-            match result {
-                Ok(inner) => inner.map(|_| ()),
-                Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "read timeout")),
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -292,7 +272,7 @@ mod tests {
 
     use std::time::Duration;
 
-    use super::{IoTimeouts, ProtocolError, handshake, request};
+    use super::{IoTimeouts, ProtocolError, SocksSession};
 
     const TEST_TIMEOUTS: IoTimeouts = IoTimeouts {
         read: Duration::from_secs(1),
@@ -304,8 +284,10 @@ mod tests {
         let (mut client, mut server) = duplex(64);
         let shutdown = CancellationToken::new();
 
-        let server_task =
-            tokio::spawn(async move { handshake(&mut server, &shutdown, TEST_TIMEOUTS).await });
+        let server_task = tokio::spawn(async move {
+            let session = SocksSession::new(&shutdown, TEST_TIMEOUTS);
+            session.handshake(&mut server).await
+        });
 
         client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
 
@@ -321,8 +303,10 @@ mod tests {
         let (mut client, mut server) = duplex(64);
         let shutdown = CancellationToken::new();
 
-        let server_task =
-            tokio::spawn(async move { request(&mut server, &shutdown, TEST_TIMEOUTS).await });
+        let server_task = tokio::spawn(async move {
+            let session = SocksSession::new(&shutdown, TEST_TIMEOUTS);
+            session.request(&mut server).await
+        });
 
         client
             .write_all(&[0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1, 0x1f, 0x90])
@@ -341,8 +325,10 @@ mod tests {
         let (mut client, mut server) = duplex(64);
         let shutdown = CancellationToken::new();
 
-        let server_task =
-            tokio::spawn(async move { request(&mut server, &shutdown, TEST_TIMEOUTS).await });
+        let server_task = tokio::spawn(async move {
+            let session = SocksSession::new(&shutdown, TEST_TIMEOUTS);
+            session.request(&mut server).await
+        });
 
         client.write_all(&[0x05, 0x01, 0x00, 0x03]).await.unwrap();
 
